@@ -1,4 +1,4 @@
-# Builds the high-res town maps (Nashville, Alamo, Dresden) every hour and publishes the site.
+# Builds the high-res town maps (Nashville, Alamo, Dresden, Knoxville, Kingsport) every hour and publishes the site.
 # Settings -> Pages -> Build and deployment -> Source must be "GitHub Actions".
 name: Build maps and deploy site
 
@@ -44,6 +44,16 @@ jobs:
           mkdir -p _site
           cp index.html _site/
           python scripts/build_maps.py --out _site/data --cache .mapcache
+
+      - name: Smart Life weather station (rain gauge)
+        env:
+          TUYA_ACCESS_ID: ${{ secrets.TUYA_ACCESS_ID }}
+          TUYA_ACCESS_SECRET: ${{ secrets.TUYA_ACCESS_SECRET }}
+          TUYA_DEVICE_ID: ${{ secrets.TUYA_DEVICE_ID }}
+          TUYA_REGION: ${{ secrets.TUYA_REGION }}
+          TUYA_RAIN_CODE: ${{ secrets.TUYA_RAIN_CODE }}
+          TUYA_RAIN_KIND: ${{ secrets.TUYA_RAIN_KIND }}
+        run: python scripts/fetch_smartlife.py --out _site/data/pws
 
       - name: Save model cache
         if: always()
