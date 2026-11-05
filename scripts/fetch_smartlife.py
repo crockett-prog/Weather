@@ -145,6 +145,7 @@ def hours_from_counter(logs, baseline, kind, now, scale, unit):
     return [round(x, 3) for x in slots]
 
 # ---------- turn the station's data points into page-ready current conditions (imperial) ----------
+STATION_ELEV_M = float(os.environ.get("STATION_ELEV_M", "117"))   # Alamo, TN is about 385 ft above sea level
 SKIP = ("unit", "convert", "alarm", "max", "min", "set", "calib", "switch", "mode", "enum", "battery", "signal")
 def _find(readings, must, prefer=(), avoid=()):
     best = None
@@ -157,7 +158,7 @@ def _find(readings, must, prefer=(), avoid=()):
         score = sum(w in lab for w in prefer)
         if best is None or score > best[0]:
             best = (score, c, r)
-    return best[2] if best else None
+    return dict(best[2], code=best[1]) if best else None
 
 def _num(r):
     try:
@@ -184,7 +185,7 @@ def normalize_current(readings):
         v, u = _num(r), (r.get("unit") or "").lower().replace(" ", "")
         if v is None:
             return None
-        if "km" in u: return v * 0.621371
+        if "km" in u or "kph" in u or "kmh" in u: return v * 0.621371
         if "mph" in u or "mi" in u: return v
         if "kn" in u: return v * 1.15078
         return v * 2.23694                    # m/s (Tuya's usual unit)
@@ -203,11 +204,18 @@ def normalize_current(readings):
     p = _find(readings, [("pressure", "baro", "atmos")], prefer=("rel", "sea"))
     if p and _num(p) is not None:
         v, u = _num(p), (p.get("unit") or "").lower()
-        if "inhg" in u: cur["pressure_inhg"] = round(v, 2)
-        elif "kpa" in u: cur["pressure_inhg"] = round(v * 0.2953, 2)
-        elif "mmhg" in u: cur["pressure_inhg"] = round(v * 0.03937, 2)
-        elif u == "pa": cur["pressure_inhg"] = round(v * 0.0002953, 2)
-        else: cur["pressure_inhg"] = round(v * 0.02953, 2)        # hPa / mbar
+        if "inhg" in u: hpa = v / 0.02953
+        elif "kpa" in u: hpa = v * 10
+        elif "mmhg" in u: hpa = v * 1.33322
+        elif u == "pa": hpa = v / 100
+        else: hpa = v                                             # hPa / mbar
+        lab = (p.get("code", "") + " " + (p.get("name") or "")).lower()
+        if not any(w in lab for w in ("rel", "sea", "slp")) and STATION_ELEV_M:
+            # the station reports absolute (station-level) pressure; NWS barometers are sea-level, so adjust
+            t_c = ((cur["temp_f"] - 32) * 5 / 9) if "temp_f" in cur else 15.0
+            h = STATION_ELEV_M
+            hpa = hpa * (1 - 0.0065 * h / (t_c + 0.0065 * h + 273.15)) ** -5.257
+        cur["pressure_inhg"] = round(hpa * 0.02953, 2)
     uv = _find(readings, [("uv",)])
     if uv and _num(uv) is not None:
         cur["uv"] = _num(uv)
