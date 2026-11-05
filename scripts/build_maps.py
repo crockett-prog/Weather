@@ -13,9 +13,11 @@ crops/regrids them around each site, and writes compact data files the web page 
 Variables (key: units):  t 2 m temp (F) · d 2 m dew point (F) · tp total precip since run start (in)
                          g surface wind gust (mph) · c total cloud cover (%) · r composite reflectivity (dBZ)
 
-Data: NOAA HRRR / NAM CONUS nest / GFS 0.25 from the NOAA Open Data buckets on AWS (NOMADS as fallback),
+Data: NOAA HRRR / GFS 0.25 from the NOAA Open Data buckets on AWS (NOMADS as fallback), NOAA RRFS (NAM's
+replacement since 2026-11-03) from NOMADS,
 ECMWF IFS 0.25 from ECMWF open data (CC-BY-4.0). No API keys.
 """
+import threading
 import argparse, concurrent.futures as cf, datetime as dt, json, math, os, pathlib, re, shutil, sys, time, traceback
 
 import numpy as np
@@ -60,11 +62,12 @@ NOAA_MODELS = {
             "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/hrrr.{ymd}/conus/hrrr.t{hh}z.wrfsfcf{fh:02d}.grib2",
         ],
     },
-    "NAM": {
-        "cycles": [0, 6, 12, 18], "fhours": list(range(0, 61)), "hires": True,
+    # RRFS replaced NAM on 2026-11-03 12Z (NWS SCN 26-47/26-48). 3 km, 84 h on 00/06/12/18Z. NOMADS only.
+    # Every hour (its precip buckets are hourly); requests are paced for the NOMADS rate limit.
+    "RRFS": {
+        "cycles": [0, 6, 12, 18], "fhours": list(range(0, 85)), "hires": True, "workers": 3,
         "urls": [
-            "https://noaa-nam-pds.s3.amazonaws.com/nam.{ymd}/nam.t{hh}z.conusnest.hiresf{fh:02d}.tm00.grib2",
-            "https://nomads.ncep.noaa.gov/pub/data/nccf/com/nam/prod/nam.{ymd}/nam.t{hh}z.conusnest.hiresf{fh:02d}.tm00.grib2",
+            "https://nomads.ncep.noaa.gov/pub/data/nccf/com/rrfs/prod/rrfs.{ymd}/{hh}/rrfs.t{hh}z.2dfld.3km.f{fh:03d}.conus.grib2",
         ],
     },
     "GFS": {
@@ -93,8 +96,22 @@ def session():
         _session = s
     return _session
 
+_nomads_lock = threading.Lock()
+_nomads_last = [0.0]
+NOMADS_MIN_GAP = 0.7     # seconds between NOMADS requests (~85/min); NOMADS blocks clients over ~120/min
+
+def _throttle(url):
+    if "nomads.ncep.noaa.gov" not in url:
+        return
+    with _nomads_lock:
+        wait = _nomads_last[0] + NOMADS_MIN_GAP - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _nomads_last[0] = time.time()
+
 def http_get(url, byte_range=None, timeout=60):
     """Return bytes, or None on 404/403. Raises on other errors. Tests replace this function."""
+    _throttle(url)
     headers = {"Range": f"bytes={byte_range[0]}-{'' if byte_range[1] is None else byte_range[1]}"} if byte_range else {}
     r = session().get(url, headers=headers, timeout=timeout)
     if r.status_code in (403, 404):
@@ -204,7 +221,7 @@ class RegularCrop:
         return vals[np.ix_(self.rows, self.cols)]
 
 class HiresRegrid:
-    """For projected grids (HRRR, NAM Lambert): linear interpolation onto a regular lat/lon grid."""
+    """For projected grids (HRRR, RRFS): linear interpolation onto a regular lat/lon grid."""
     def __init__(self, lats, lons, box, step=HIRES_STEP, margin=0.2):
         from scipy.spatial import Delaunay
         m = (lats >= box["s"] - margin) & (lats <= box["n"] + margin) & (lons >= box["w"] - margin) & (lons <= box["e"] + margin)
@@ -303,7 +320,7 @@ def process_noaa(name, cfg, run, tmpl):
         return fh, res
 
     errors = 0
-    with cf.ThreadPoolExecutor(max_workers=12) as ex:
+    with cf.ThreadPoolExecutor(max_workers=cfg.get("workers", 12)) as ex:
         futs = [ex.submit(work, fh) for fh in fhours]
         for f in cf.as_completed(futs):
             try:
@@ -439,7 +456,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="_site/data")
     ap.add_argument("--cache", default=".mapcache")
-    ap.add_argument("--models", default="HRRR,NAM,GFS,ECMWF")
+    ap.add_argument("--models", default="HRRR,RRFS,GFS,ECMWF")
     args = ap.parse_args(argv)
     out = pathlib.Path(args.out); out.mkdir(parents=True, exist_ok=True)
     cache = pathlib.Path(args.cache); cache.mkdir(parents=True, exist_ok=True)
@@ -455,14 +472,15 @@ def main(argv=None):
         try:
             run, job = build_ecmwf(now) if model == "ECMWF" else build_noaa(model, NOAA_MODELS[model], now)
             run_s = run.strftime("%Y-%m-%dT%H:00Z")
-            if cached and cached.get("run") == run_s:
+            missing_sites = [k for k in SITES if cached and k not in cached.get("sites", cached.get("entries", {}))]
+            if cached and cached.get("run") == run_s and not missing_sites:
                 log(f"{model}: run {run_s} unchanged, reusing cache")
             else:
                 result = job()
                 tmp = cache / f"{model}.new"
                 shutil.rmtree(tmp, ignore_errors=True)
                 entries = write_model(result, model, tmp / "files")
-                (tmp / "meta.json").write_text(json.dumps({"run": run_s, "entries": entries}))
+                (tmp / "meta.json").write_text(json.dumps({"run": run_s, "entries": entries, "sites": list(SITES)}))
                 shutil.rmtree(mcache, ignore_errors=True)
                 tmp.rename(mcache)
                 cached = json.loads(meta_path.read_text())
@@ -473,6 +491,11 @@ def main(argv=None):
             status["models"][model] = {"ok": False, "error": str(e)[:300],
                                        "run": cached.get("run") if cached else None, "stale": bool(cached)}
             log(f"{model}: FAILED ({e}){' - keeping previous run ' + cached['run'] if cached else ''}")
+        if cached and cached.get("run"):
+            age_h = (now - dt.datetime.strptime(cached["run"], "%Y-%m-%dT%H:00Z")).total_seconds() / 3600
+            if age_h > 36:
+                log(f"{model}: newest data ({cached['run']}) is {age_h:.0f} h old - not publishing it")
+                cached = None
         if cached:
             src = mcache / "files"
             if src.exists():
