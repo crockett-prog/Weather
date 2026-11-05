@@ -60,7 +60,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .mapcache
-          key: mapcache-${{ github.run_id }}
+          key: mapcache-${{ github.run_id }}-${{ github.run_attempt }}   # re-runs get their own key
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
