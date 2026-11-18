@@ -21,7 +21,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 80   # the first build after this update rebuilds all four models
     steps:
       - uses: actions/checkout@v4
 
