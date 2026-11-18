@@ -10,6 +10,12 @@ crops/regrids them around each site, and writes compact data files the web page 
   <out>/<site>/<MODEL>_<var>.bin   uint16 little-endian, frames x rows(south->north) x cols(west->east)
   <out>/status.json            what was built, what failed
 
+Each site manifest also carries a point forecast per model ("point": hourly series at the town itself,
+taken from the model's native grid). The page's comparison chart, model stats and daily table use it on
+the town pages, so those no longer depend on Open-Meteo (which drops HRRR on 2026-11-30).
+Point keys: t, d (F) · tp precip in the hour ending at that time (in) · g gust, w 10 m wind (mph)
+            · c cloud (%) · p mean sea-level pressure (hPa)
+
 Variables (key: units):  t 2 m temp (F) · d 2 m dew point (F) · tp total precip since run start (in)
                          g surface wind gust (mph) · c total cloud cover (%) · r composite reflectivity (dBZ)
 
@@ -37,6 +43,9 @@ SITES = {
 }
 RADIUS_MI = 75          # data box half-size; the page shows a 50-mile radius
 HIRES_STEP = 0.03       # output grid spacing (deg) for the 3 km models (~3 km)
+MAP_MAX_H = 120         # maps stop at 120 h; GFS/ECMWF frames beyond that feed only the point forecast
+GRID_VARS = ("t", "d", "tp", "g", "c", "r")   # drawn as maps; u, v, p are point-only
+CACHE_V = 2             # bump to force a rebuild when the cached format changes
 
 ENC = {  # var: (offset, scale) for uint16 encoding; 65535 = missing
     "t": (-100.0, 0.01), "d": (-100.0, 0.01), "tp": (0.0, 0.001),
@@ -52,6 +61,9 @@ IDX_PATTERNS = [
     ("g",  re.compile(r"^GUST:surface:")),
     ("c",  re.compile(r"^TCDC:entire atmosphere")),
     ("r",  re.compile(r"^REFC:entire atmosphere")),
+    ("u",  re.compile(r"^UGRD:10 m above ground:")),
+    ("v",  re.compile(r"^VGRD:10 m above ground:")),
+    ("p",  re.compile(r"^(PRMSL|MSLMA|MSLET):mean sea level:")),
 ]
 
 NOAA_MODELS = {
@@ -71,15 +83,17 @@ NOAA_MODELS = {
         ],
     },
     "GFS": {
-        "cycles": [0, 6, 12, 18], "fhours": list(range(0, 121, 3)), "hires": False,
+        # 3-hourly to 120 h (maps + point), then 6-hourly to 240 h (point forecast only)
+        "cycles": [0, 6, 12, 18], "fhours": list(range(0, 121, 3)) + list(range(126, 241, 6)), "hires": False,
         "urls": [
             "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.{ymd}/{hh}/atmos/gfs.t{hh}z.pgrb2.0p25.f{fh:03d}",
             "https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{ymd}/{hh}/atmos/gfs.t{hh}z.pgrb2.0p25.f{fh:03d}",
         ],
     },
 }
-ECMWF_STEPS = list(range(0, 121, 3))
-ECMWF_PARAMS = {"2t": "t", "2d": "d", "tp": "tp", "tcc": "c", "10fg": "g"}
+ECMWF_STEPS = list(range(0, 121, 3))                                    # 06/18Z runs (and the fallback)
+ECMWF_STEPS_LONG = list(range(0, 145, 3)) + list(range(150, 241, 6))    # 00/12Z runs go to 240 h and beyond
+ECMWF_PARAMS = {"2t": "t", "2d": "d", "tp": "tp", "tcc": "c", "10fg": "g", "10u": "u", "10v": "v", "msl": "p"}
 
 # --------------------------------------------------------------------------------------------
 def log(*a):
@@ -129,8 +143,10 @@ def to_units(var, v):
         return (v - 273.15) * 9.0 / 5.0 + 32.0
     if var == "tp":
         return v / 25.4            # kg m-2 == mm -> inches
-    if var == "g":
+    if var in ("g", "u", "v"):
         return v * 2.236936        # m/s -> mph
+    if var == "p":
+        return v / 100.0           # Pa -> hPa
     return v
 
 def encode(var, arr):
@@ -240,6 +256,36 @@ class HiresRegrid:
         f = LinearNDInterpolator(self.tri, vals[self.mask])
         return f(self.targets).reshape(self.ny, self.nx)
 
+class PointSampler:
+    """Value at one location: inverse-distance weighting of the 4 nearest native grid points."""
+    def __init__(self, lats, lons, lat, lon, k=4):
+        la = np.asarray(lats, dtype=np.float64).ravel()
+        lo = np.asarray(lons, dtype=np.float64).ravel()
+        dy = la - lat
+        dx = (lo - lon) * math.cos(math.radians(lat))
+        d2 = dx * dx + dy * dy
+        idx = np.argpartition(d2, k)[:k]
+        d = np.sqrt(d2[idx])
+        if d.min() > 0.5:
+            raise ValueError("site outside model grid")
+        w = 1.0 / np.maximum(d, 1e-6) ** 2
+        self.idx, self.w = idx, w / w.sum()
+    def __call__(self, vals):
+        v = np.asarray(vals, dtype=np.float64).ravel()[self.idx]
+        m = np.isfinite(v)
+        if not m.any():
+            return float("nan")
+        return float((v[m] * self.w[m]).sum() / self.w[m].sum())
+
+def make_samplers(lats, lons, keys):
+    out = {}
+    for key in keys:
+        try:
+            out[key] = PointSampler(lats, lons, SITES[key]["lat"], SITES[key]["lon"])
+        except Exception as e:
+            log(f"  {key}: no point ({e})")
+    return out
+
 def make_mappers(lats, lons, hires):
     mappers = {}
     for key, site in SITES.items():
@@ -289,7 +335,7 @@ def build_noaa(name, cfg, now):
     run, tmpl = find_noaa_run(name, cfg, now)
     if run is None:
         raise RuntimeError("no complete run found")
-    return run, (lambda: process_noaa(name, cfg, run, tmpl))
+    return run, (lambda: process_noaa(name, cfg, run, tmpl)), ""
 
 def process_noaa(name, cfg, run, tmpl):
     fhours = cfg["fhours"]
@@ -302,21 +348,29 @@ def process_noaa(name, cfg, run, tmpl):
     mappers = make_mappers(lats, lons, cfg["hires"])
     if not mappers:
         raise RuntimeError("no site inside grid")
+    samplers = make_samplers(lats, lons, list(mappers))
     log(f"{name}: grid ready; sites {list(mappers)}; downloading {len(fhours)} frames")
 
     frames = {}  # fh -> {var: {site: arr}} ; tp -> list of (a,b,{site:arr})
     def work(fh):
         _, recs = (fhours[0], recs0) if fh == fhours[0] else fetch_noaa_frame(tmpl, run, fh)
-        res = {"tp": []}
+        res = {"tp": [], "pt": {}, "pt_tp": []}
+        map_frame = fh <= MAP_MAX_H
         for var, desc, data in recs:
             vals, _, _ = decode(data)
-            per_site = {k: to_units(var, mp(vals)) for k, mp in mappers.items()}
+            pt = {k: to_units(var, s(vals)) for k, s in samplers.items()} if var != "r" else None
+            per_site = {k: to_units(var, mp(vals)) for k, mp in mappers.items()} if (map_frame and var in GRID_VARS) else None
             if var == "tp":
                 rng = acc_range(desc)
                 if rng:
-                    res["tp"].append((rng[0], rng[1], per_site))
+                    if per_site is not None:
+                        res["tp"].append((rng[0], rng[1], per_site))
+                    res["pt_tp"].append((rng[0], rng[1], pt))
             else:
-                res[var] = per_site
+                if per_site is not None:
+                    res[var] = per_site
+                if pt is not None:
+                    res["pt"][var] = pt
         return fh, res
 
     errors = 0
@@ -332,7 +386,7 @@ def process_noaa(name, cfg, run, tmpl):
     if not frames:
         raise RuntimeError("all frames failed")
     log(f"{name}: {len(frames)} frames ok, {errors} failed")
-    return assemble(name, run, mappers, frames, sorted(frames))
+    return assemble(name, run, mappers, frames, sorted(frames), samplers)
 
 def precip_totals(frames, fhs, site):
     """Total precip since run start at each frame, from whatever accumulation buckets the model provides."""
@@ -354,9 +408,69 @@ def precip_totals(frames, fhs, site):
         out.append(best)
     return out
 
-def assemble(name, run, mappers, frames, fhs):
-    """-> {site: {meta, data:{var: ndarray(frames, ny, nx)}}}"""
+def point_precip(frames, fhs, site):
+    """Run-total precip at the point for each frame (None where it can't be pieced together)."""
+    totals = {0: 0.0}
+    out = []
+    for fh in fhs:
+        if fh == 0:
+            out.append(0.0); continue
+        best = None
+        recs = [r for r in frames[fh].get("pt_tp", []) if r[2] and site in r[2]]
+        for a, b, per in recs:
+            if b == fh and a == 0:
+                best = per[site]; break
+        if best is None:
+            for a, b, per in recs:
+                if b == fh and totals.get(a) is not None:
+                    best = totals[a] + per[site]; break
+        totals[fh] = best
+        out.append(best)
+    return out
+
+def to_hourly(fhs, vals):
+    """Linear interpolation onto every hour; no filling across missing frames."""
+    fh = np.asarray(fhs, dtype=np.float64)
+    v = np.asarray([np.nan if x is None else x for x in vals], dtype=np.float64)
+    hours = np.arange(int(fh[0]), int(fh[-1]) + 1)
+    out = np.full(len(hours), np.nan)
+    ok = np.isfinite(v)
+    for i in range(len(fh)):
+        if ok[i]:
+            out[hours == fh[i]] = v[i]
+        if i + 1 < len(fh) and ok[i] and ok[i + 1]:
+            seg = (hours >= fh[i]) & (hours <= fh[i + 1])
+            out[seg] = np.interp(hours[seg], fh[i:i + 2], v[i:i + 2])
+    return hours, out
+
+def point_series(run, frames, fhs, site):
+    """Hourly point forecast for one site: {times, t, d, tp, g, w, c, p}."""
+    def col(var):
+        return [frames[fh].get("pt", {}).get(var, {}).get(site) for fh in fhs]
+    raw = {k: col(k) for k in ("t", "d", "g", "c", "p")}
+    u, v = col("u"), col("v")
+    raw["w"] = [None if (a is None or b is None) else math.hypot(a, b) for a, b in zip(u, v)]
+    hours, cum = to_hourly(fhs, point_precip(frames, fhs, site))
+    hourly = np.full(len(hours), np.nan)
+    hourly[1:] = np.diff(cum)
+    if hours[0] == 0:
+        hourly[0] = 0.0
+    hourly = np.where(np.isfinite(hourly), np.clip(hourly, 0, None), np.nan)
+    def clean(a, nd):
+        return [None if not np.isfinite(x) else round(float(x), nd) for x in a]
+    out = {"times": [(run + dt.timedelta(hours=int(h))).strftime("%Y-%m-%dT%H:00Z") for h in hours],
+           "tp": clean(hourly, 3)}
+    for k, nd in (("t", 1), ("d", 1), ("g", 1), ("w", 1), ("c", 0), ("p", 1)):
+        out[k] = clean(to_hourly(fhs, raw[k])[1], nd)
+    if not any(x is not None for x in out["t"]):
+        return None
+    return out
+
+def assemble(name, run, mappers, frames, fhs, samplers=None):
+    """-> {site: {meta, data:{var: ndarray(frames, ny, nx)}, point}}"""
     result = {}
+    all_fhs = fhs
+    fhs = [fh for fh in all_fhs if fh <= MAP_MAX_H]
     for key, mp in mappers.items():
         shape = (mp.ny, mp.nx)
         data = {}
@@ -371,6 +485,13 @@ def assemble(name, run, mappers, frames, fhs):
         steps = np.diff(fhs)
         result[key] = {"run": run.strftime("%Y-%m-%dT%H:00Z"), "bounds": mp.bounds, "nx": mp.nx, "ny": mp.ny,
                        "times": times, "step": int(steps.min()) if len(steps) else 1, "data": data}
+        if samplers and key in samplers:
+            try:
+                pt = point_series(run, frames, all_fhs, key)
+                if pt:
+                    result[key]["point"] = pt
+            except Exception as e:
+                log(f"{name}: point forecast for {key} failed: {e}")
     return result
 
 # --------------------------------------------------------------------------------------------
@@ -384,21 +505,28 @@ def build_ecmwf(now):
             client = Client(source=source, maximum_retries=3, retry_after=15)   # library default retries for hours
             run = client.latest(type="fc", step=ECMWF_STEPS[-1], param="2t")
             run = run.replace(tzinfo=None)
-            log(f"ECMWF: newest run {run:%Y-%m-%d %HZ} via {source}")
-            return run, (lambda c=client, r=run: process_ecmwf(c, r))
+            steps = ECMWF_STEPS
+            if run.hour in (0, 12):
+                try:   # the long range is published a few hours after step 120: use it only once it's all there
+                    if client.latest(type="fc", step=ECMWF_STEPS_LONG[-1], param="2t").replace(tzinfo=None) == run:
+                        steps = ECMWF_STEPS_LONG
+                except Exception as e:
+                    log(f"ECMWF: long range check failed ({e})")
+            log(f"ECMWF: newest run {run:%Y-%m-%d %HZ} via {source}, to {steps[-1]} h")
+            return run, (lambda c=client, r=run, s=steps: process_ecmwf(c, r, s)), f"{steps[-1]}h"
         except Exception as e:
             last_err = e
             log(f"ECMWF: source {source} failed: {e}")
     raise RuntimeError(f"ECMWF unavailable: {last_err}")
 
-def process_ecmwf(client, run):
+def process_ecmwf(client, run, steps=ECMWF_STEPS):
     import pygrib
     tmp = pathlib.Path("ecmwf_tmp"); tmp.mkdir(exist_ok=True)
     per_param = {}
     for param, var in ECMWF_PARAMS.items():
         target = tmp / f"{param}.grib2"
         try:
-            client.retrieve(date=run.strftime("%Y%m%d"), time=run.hour, type="fc", step=ECMWF_STEPS, param=param, target=str(target))
+            client.retrieve(date=run.strftime("%Y%m%d"), time=run.hour, type="fc", step=steps, param=param, target=str(target))
             per_param[param] = target
         except Exception as e:
             log(f"ECMWF: {param} unavailable ({e})")
@@ -409,7 +537,8 @@ def process_ecmwf(client, run):
     lats, lons = m0.latlons(); lons = ((lons + 180.0) % 360.0) - 180.0
     grbs.close()
     mappers = make_mappers(lats, lons, hires=False)
-    frames = {fh: {"tp": []} for fh in ECMWF_STEPS}
+    samplers = make_samplers(lats, lons, list(mappers))
+    frames = {fh: {"tp": [], "pt": {}, "pt_tp": []} for fh in steps}
     for param, path in per_param.items():
         var = ECMWF_PARAMS[param]
         for msg in pygrib.open(str(path)):
@@ -418,21 +547,26 @@ def process_ecmwf(client, run):
                 continue
             vals = msg.values
             vals = np.ma.filled(vals.astype(np.float64), np.nan) if np.ma.isMaskedArray(vals) else np.asarray(vals, dtype=np.float64)
-            if var == "t" or var == "d":
-                per = {k: to_units(var, mp(vals)) for k, mp in mappers.items()}
-            elif var == "tp":
-                per = {k: mp(vals) * 39.3701 for k, mp in mappers.items()}       # metres -> inches
-            elif var == "c":
-                per = {k: (mp(vals) * (100.0 if np.nanmax(vals) <= 1.01 else 1.0)) for k, mp in mappers.items()}
-            else:  # gust m/s
-                per = {k: to_units("g", mp(vals)) for k, mp in mappers.items()}
             if var == "tp":
-                frames[fh]["tp"].append((0, fh, per))
+                conv = lambda a: a * 39.3701                                     # metres -> inches
+            elif var == "c":
+                f = 100.0 if np.nanmax(vals) <= 1.01 else 1.0
+                conv = lambda a, f=f: a * f
+            else:                                                                # t, d (K) · g, u, v (m/s) · p (Pa)
+                conv = lambda a, v=var: to_units(v, a)
+            pt = {k: conv(s(vals)) for k, s in samplers.items()}
+            per = {k: conv(mp(vals)) for k, mp in mappers.items()} if (var in GRID_VARS and fh <= MAP_MAX_H) else None
+            if var == "tp":
+                if per is not None:
+                    frames[fh]["tp"].append((0, fh, per))
+                frames[fh]["pt_tp"].append((0, fh, pt))
             else:
-                frames[fh][var] = per
+                if per is not None:
+                    frames[fh][var] = per
+                frames[fh]["pt"][var] = pt
     shutil.rmtree(tmp, ignore_errors=True)
-    fhs = [fh for fh in ECMWF_STEPS if "t" in frames[fh]]
-    return assemble("ECMWF", run, mappers, frames, fhs)
+    fhs = [fh for fh in steps if "t" in frames[fh]["pt"]]
+    return assemble("ECMWF", run, mappers, frames, fhs, samplers)
 
 # --------------------------------------------------------------------------------------------
 # output + cache
@@ -450,6 +584,8 @@ def write_model(result, model, outdir):
             vars_meta[var] = {"file": fn, "offset": off, "scale": sc}
         entries[site] = {k: r[k] for k in ("run", "bounds", "nx", "ny", "times", "step")}
         entries[site]["vars"] = vars_meta
+        if r.get("point"):
+            entries[site]["point"] = r["point"]
     return entries
 
 def main(argv=None):
@@ -470,17 +606,18 @@ def main(argv=None):
         cached = json.loads(meta_path.read_text()) if meta_path.exists() else None
         t0 = time.time()
         try:
-            run, job = build_ecmwf(now) if model == "ECMWF" else build_noaa(model, NOAA_MODELS[model], now)
+            run, job, tag = build_ecmwf(now) if model == "ECMWF" else build_noaa(model, NOAA_MODELS[model], now)
             run_s = run.strftime("%Y-%m-%dT%H:00Z")
             missing_sites = [k for k in SITES if cached and k not in cached.get("sites", cached.get("entries", {}))]
-            if cached and cached.get("run") == run_s and not missing_sites:
+            same = cached and cached.get("run") == run_s and cached.get("v") == CACHE_V and cached.get("tag", "") == tag
+            if same and not missing_sites:
                 log(f"{model}: run {run_s} unchanged, reusing cache")
             else:
                 result = job()
                 tmp = cache / f"{model}.new"
                 shutil.rmtree(tmp, ignore_errors=True)
                 entries = write_model(result, model, tmp / "files")
-                (tmp / "meta.json").write_text(json.dumps({"run": run_s, "entries": entries, "sites": list(SITES)}))
+                (tmp / "meta.json").write_text(json.dumps({"run": run_s, "entries": entries, "sites": list(SITES), "v": CACHE_V, "tag": tag}))
                 shutil.rmtree(mcache, ignore_errors=True)
                 tmp.rename(mcache)
                 cached = json.loads(meta_path.read_text())
@@ -503,6 +640,10 @@ def main(argv=None):
             for site, entry in cached["entries"].items():
                 if site in manifest:
                     manifest[site]["models"][model] = entry
+            status["models"][model]["sites"] = sorted(cached["entries"])
+            status["models"][model]["point"] = sorted(k for k, e in cached["entries"].items() if e.get("point"))
+        else:
+            status["models"][model]["sites"] = []
 
     for site, m in manifest.items():
         (out / f"{site}.json").write_text(json.dumps(m, separators=(",", ":")))
